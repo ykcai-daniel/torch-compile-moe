@@ -1,4 +1,4 @@
-# Optimizing MoE Models through Customized Torch FX Passes
+# Optimizing Mixture-of-Experts (MoE) Models through Customized Torch FX Passes
 
 ## Group Information
 - Haojia Sun: haojias@andrew.cmu.edu
