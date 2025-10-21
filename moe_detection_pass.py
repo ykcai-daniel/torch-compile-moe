@@ -4,6 +4,8 @@ from torch.fx import GraphModule, Node
 from typing import Dict, List, Tuple, Set
 from dataclasses import dataclass
 
+import torch.nn as nn
+import torch.nn.functional as F
 
 @dataclass
 class MoEPattern:
@@ -268,6 +270,118 @@ def detect_moe_patterns(model: torch.nn.Module) -> Tuple[GraphModule, List[MoEPa
     
     return traced, patterns
 
+class Expert(nn.Module):
+    """Single expert network"""
+    def __init__(self, hidden_dim: int, ffn_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_dim, ffn_dim)
+        self.fc2 = nn.Linear(ffn_dim, hidden_dim)
+        self.activation = nn.GELU()
+    
+    def forward(self, x):
+        return self.fc2(self.activation(self.fc1(x)))
+
+
+
+class MoELayer(nn.Module):
+    """Mixture of Experts Layer"""
+    def __init__(self, hidden_dim: int = 1024, ffn_dim : int= 512, num_experts: int = 16, top_k: int = 4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        
+        # Router/gating network
+        self.gate = nn.Linear(hidden_dim, num_experts)
+        
+        # Expert networks
+        self.experts = nn.ModuleList([
+            Expert(hidden_dim, ffn_dim) for _ in range(num_experts)
+        ])
+    
+    def forward(self, x):
+        # x: [batch_size, seq_len, hidden_dim]
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)  # [batch_size * seq_len, hidden_dim]
+        
+        # Router logits
+        router_logits = self.gate(x_flat)  # [batch_size * seq_len, num_experts]
+        
+        # Get top-k experts
+        router_weights, selected_experts = torch.topk(
+            router_logits, self.top_k, dim=-1
+        )  # Both: [batch_size * seq_len, top_k]
+        router_weights = F.softmax(router_weights, dim=-1)
+        
+        # Initialize output
+        output = torch.zeros_like(x_flat)
+        
+        # Process each expert
+        for i, expert in enumerate(self.experts):
+            # Find tokens routed to this expert
+            expert_mask = (selected_experts == i).any(dim=-1)  # [batch_size * seq_len]
+            if not expert_mask.any():
+                continue
+            
+            # Get tokens for this expert
+            expert_input = x_flat[expert_mask]
+            expert_output = expert(expert_input)
+            
+            # Get weights for this expert
+            expert_weights = torch.zeros(expert_mask.sum(), device=x.device)
+            for k in range(self.top_k):
+                mask_k = selected_experts[expert_mask, k] == i
+                expert_weights[mask_k] = router_weights[expert_mask, k][mask_k]
+            
+            # Add weighted output
+            output[expert_mask] += expert_output * expert_weights.unsqueeze(-1)
+        
+        return output.view(batch_size, seq_len, hidden_dim)
+
+class MoELayerOptimized(nn.Module):
+    """Optimized MoE implementation for better compilation"""
+    def __init__(self, hidden_dim: int = 1024, ffn_dim : int= 512, num_experts: int = 16, top_k: int = 4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        
+        # Router
+        self.gate = nn.Linear(hidden_dim, num_experts)
+        
+        # Batched expert weights for parallel computation
+        self.w1 = nn.Parameter(torch.randn(num_experts, hidden_dim, ffn_dim))
+        self.w2 = nn.Parameter(torch.randn(num_experts, ffn_dim, hidden_dim))
+        self.activation = nn.GELU()
+    
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)
+        
+        # Router
+        router_logits = self.gate(x_flat)
+        router_weights, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+        router_weights = F.softmax(router_weights, dim=-1)
+        
+        # Batch expert computation
+        output = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            expert_idx = selected_experts[:, k]
+            weights = router_weights[:, k].unsqueeze(-1)
+            
+            # Gather expert weights
+            w1_selected = self.w1[expert_idx]  # [tokens, hidden_dim, ffn_dim]
+            w2_selected = self.w2[expert_idx]  # [tokens, ffn_dim, hidden_dim]
+            
+            # Apply expert
+            h = torch.bmm(x_flat.unsqueeze(1), w1_selected).squeeze(1)
+            h = self.activation(h)
+            expert_out = torch.bmm(h.unsqueeze(1), w2_selected).squeeze(1)
+            
+            output += expert_out * weights
+        
+        return output.view(batch_size, seq_len, hidden_dim)
+
 
 # Example usage
 if __name__ == "__main__":
@@ -306,11 +420,12 @@ if __name__ == "__main__":
     # Detect patterns
     model = SimpleMoE()
     traced, patterns = detect_moe_patterns(model)
-    
-    print(f"Detected {len(patterns)} MoE pattern(s):")
-    for i, pattern in enumerate(patterns, 1):
-        print(f"\nPattern {i}:")
-        print(f"  Router: {pattern.router_node.name}")
-        print(f"  Top-K: {pattern.topk_node.name if pattern.topk_node else 'None'}")
-        print(f"  Experts: {[e.name for e in pattern.expert_nodes]}")
-        print(f"  Combine: {pattern.combine_node.name}")
+
+    model_basic = MoELayer()
+
+    model_optimized = MoELayerOptimized()
+
+    #traced_basic, patterns_basic = detect_moe_patterns(model_basic)
+
+    traced_opt, patterns_opt = detect_moe_patterns(model_optimized)
+

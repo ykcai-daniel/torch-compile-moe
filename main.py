@@ -327,5 +327,119 @@ def run_comprehensive_benchmark():
         json.dump(results, f, indent=2)
     print("Results saved to: moe_benchmark_results.json")
 
+import torch
+import torch.fx as fx
+from torch._inductor import config as inductor_config
+from torch._inductor.compile_fx import compile_fx
+import copy
+
+def compile_model(model: torch.nn.Module, example_input: torch.Tensor):
+    """
+    Compile a model and dump FX graphs before and after optimization passes.
+    
+    Args:
+        model: PyTorch model to compile
+        example_input: Example input tensor for tracing
+    
+    Returns:
+        Compiled model
+    """
+    print("=" * 80)
+    print("COMPILING MODEL")
+    print("=" * 80)
+    
+    # Store graphs at different stages
+    graphs = {}
+    
+    def capturing_backend(gm: fx.GraphModule, example_inputs):
+        """Custom backend that captures graphs before optimization"""
+        print("\n" + "=" * 80)
+        print("INITIAL FX GRAPH (Before Optimizations)")
+        print("=" * 80)
+        print(gm.graph)
+        print("\n--- Generated Python Code ---")
+        print(gm.code)
+        
+        # Store the initial graph
+        graphs['initial'] = copy.deepcopy(gm)
+        
+        # Now apply TorchInductor's optimization passes
+        print("\n" + "=" * 80)
+        print("APPLYING OPTIMIZATION PASSES...")
+        print("=" * 80)
+        
+        # Use inductor's compilation pipeline
+        from torch._inductor.decomposition import decompositions
+        from torch._functorch.aot_autograd import aot_module_simplified
+        
+        # AOT Autograd performs lowering and optimization
+        def fw_compiler(gm: fx.GraphModule, example_inputs):
+            print("\n" + "=" * 80)
+            print("OPTIMIZED FX GRAPH (After Passes)")
+            print("=" * 80)
+            print(gm.graph)
+            print("\n--- Optimized Python Code ---")
+            print(gm.code)
+            
+            graphs['optimized'] = copy.deepcopy(gm)
+            
+            # Continue with actual compilation
+            return compile_fx(gm, example_inputs)
+        
+        # Apply decompositions and optimizations
+        optimized = aot_module_simplified(
+            gm,
+            example_inputs,
+            fw_compiler=fw_compiler
+        )
+        
+        return optimized
+    
+    # Compile with our custom backend
+    compiled_model = torch.compile(model, backend=capturing_backend,dynamic=True)
+    
+    # Trigger compilation by running forward pass
+    print("\n" + "=" * 80)
+    print("TRIGGERING COMPILATION (First Forward Pass)")
+    print("=" * 80)
+    
+    with torch.no_grad():
+        output = compiled_model(example_input)
+    
+    print("\n" + "=" * 80)
+    print("COMPILATION COMPLETE")
+    print("=" * 80)
+    print(f"Output shape: {output.shape}")
+    
+    # Optionally save graphs to files
+    if graphs:
+        print("\n--- Saving graphs to files ---")
+        if 'initial' in graphs:
+            with open("initial_graph.txt", "w") as f:
+                f.write(str(graphs['initial'].graph))
+                f.write("\n\n=== CODE ===\n\n")
+                f.write(graphs['initial'].code)
+            print("✓ Saved initial_graph.txt")
+        
+        if 'optimized' in graphs:
+            with open("optimized_graph.txt", "w") as f:
+                f.write(str(graphs['optimized'].graph))
+                f.write("\n\n=== CODE ===\n\n")
+                f.write(graphs['optimized'].code)
+            print("✓ Saved optimized_graph.txt")
+    
+    return compiled_model
+
 if __name__ == "__main__":
-    run_comprehensive_benchmark()
+    # run_comprehensive_benchmark()
+    
+    hidden_dim = 1024
+    ffn_dim = 512
+    num_expert = 16
+    top_k = 4
+    moe_model_basic = MoELayer(hidden_dim, ffn_dim, num_expert, top_k)
+    batch_size = 10
+    sec_len = 40
+    example_tensor = torch.rand(batch_size,sec_len, hidden_dim)
+
+    compile_model(moe_model_basic,example_tensor)
