@@ -6,11 +6,12 @@ import torch.nn as nn
 
 class SwiGLUMoE(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_experts, top_k: int = 2):
-        # allocate expert a single weight tensor
         super(SwiGLUMoE, self).__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.expert_weights = nn.Parameter(torch.randn(num_experts, input_dim, hidden_dim * 2)) # [num_experts, d_model, 2 * hidden_dim]
+        # two weights: value & gate
+        self.expert_weights_v = nn.Parameter(torch.randn(num_experts, input_dim, hidden_dim))  # [num_experts, d_model, hidden_dim]
+        self.expert_weights_g = nn.Parameter(torch.randn(num_experts, input_dim, hidden_dim))  # [num_experts, d_model, hidden_dim]
         self.gate = nn.Linear(input_dim, num_experts)
 
     def forward(self, x: torch.Tensor, expert_indices: torch.Tensor | None = None) -> torch.Tensor:
@@ -32,18 +33,20 @@ class SwiGLUMoE(nn.Module):
             top_k = topk_indices.shape[1]
             topk_scores = torch.gather(router_probs, 1, topk_indices)
 
-        # Dispatch with grouped_gemm. This returns [batch * top_k, 2 * hidden_dim],
-        # ordered by original token ids, so we can reshape back to [batch, top_k, 2 * hidden_dim].
-        grouped_out = grouped_gemm(
+        grouped_val = grouped_gemm(
             tokens=x,
-            weights=self.expert_weights,
+            weights=self.expert_weights_v,
             top_k_expert_activation=topk_indices,
-        )
-        grouped_out = grouped_out.view(batch, top_k, -1)
+        ).view(batch, top_k, -1) # call the grouped_gemm twice to calculate value and gate
 
-        # SwiGLU: split the 2 * hidden_dim dimension into value and gate parts.
-        val, gate = torch.chunk(grouped_out, 2, dim=-1)
-        activated = val * torch.sigmoid(gate)
+        grouped_gate = grouped_gemm(
+            tokens=x,
+            weights=self.expert_weights_g,
+            top_k_expert_activation=topk_indices,
+        ).view(batch, top_k, -1)
+
+        # SwiGLU: val * σ(gate)
+        activated = grouped_val * torch.sigmoid(grouped_gate)
 
         # Weight expert outputs by router probabilities and combine.
         weighted_sum = (activated * topk_scores.unsqueeze(-1)).sum(dim=1)
