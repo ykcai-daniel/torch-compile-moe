@@ -1,244 +1,364 @@
+import triton
+import triton.language as tl
 import torch
-import torch.fx as fx
-from typing import Dict, Tuple, List, Optional
-import operator
+from typing import List
+from torch.library import custom_op, register_fake
 
-# --- 1. THE CUSTOM FUSED OPERATOR (STANDARD PYTHON FUNCTION) ---
-
-def custom_grouped_gemm_impl(a: torch.Tensor, b_group: torch.Tensor, num_groups: int) -> torch.Tensor:
+@triton.jit
+def grouped_gemm_kernel(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,  # d_ff
+    K,  # d_model
+    EM,  # total tokens * top_k (padded)
+    num_valid_tokens,
+    # Stride variables
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    top_k: tl.constexpr,
+):
     """
-    This function represents your custom, fused Triton kernel.
-    
-    In a real application, this is where you would call your triton.kernel.launch().
-    For this demo, it uses standard PyTorch ops as a runnable fallback/simulation
-    to ensure the shape and output are correct for compilation.
-    
-    NOTE: Since we couldn't use torch.library, the compiler relies on symbolically 
-    tracing this Python fallback for shape inference.
+    Simplified fused MOE kernel for grouped GEMM.
+    Computes C = A @ B where A is tokens and B is expert weights.
     """
+    # Map program ids to blocks
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Check if this block is valid
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
     
-    assert a.size(0) % num_groups == 0, "Input batch must be divisible by num_groups"
+    # Load token ids for this block
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    token_mask = offs_token < num_valid_tokens
+
+    # Load expert id for this block
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        # Write zeros for invalid experts
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        tl.store(c_ptrs, zeros, mask=c_mask)
+        return
+
+    # Create pointers for A and B blocks
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
     
-    # Simulate the unrolled batched matmul result
-    input_groups = torch.split(a, a.size(0) // num_groups, dim=0)
-    output_parts = []
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
     
-    for i in range(num_groups):
-        output_parts.append(torch.matmul(input_groups[i], b_group[i]))
-        
-    return torch.cat(output_parts, dim=0)
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    )
 
-# The function used as the target in the FX graph replacement
-GROUPED_GEMM_FUNCTION = custom_grouped_gemm_impl
-
-# -------------------------------------------------------------------
-
-# --- 2. EXAMPLE MODEL (THE PATTERN TARGET) ---
-
-class SimpleGroupedPattern(torch.nn.Module):
-    """
-    A model simulating a grouped matmul/MoE dispatch pattern that the pass will replace.
-    The sequence is: split -> [matmul, matmul, ...] -> cat.
-    """
-    def __init__(self, in_features, out_features, num_groups):
-        super().__init__()
-        self.num_groups = num_groups
-        # Weight tensor is grouped: [num_groups, in_features, out_features]
-        self.weight = torch.nn.Parameter(
-            torch.randn(num_groups, in_features, out_features)
+    # Accumulate in fp32 for accuracy
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Iterate over K dimension
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load blocks of A and B
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
         )
-
-    def forward(self, x):
-        # 1. Split the input into N groups
-        x_groups = torch.split(x, x.size(0) // self.num_groups, dim=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         
-        output_parts = []
-        for i in range(self.num_groups):
-            # 2. Perform N independent matmuls
-            out = torch.matmul(x_groups[i], self.weight[i])
-            output_parts.append(out)
+        # Matrix multiply and accumulate
+        accumulator += tl.dot(a, b)
         
-        # 3. Concatenate the results (This is the end of the pattern)
-        return torch.cat(output_parts, dim=0)
+        # Advance pointers
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
-# -------------------------------------------------------------------
+    # Write output
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
 
-# --- 3. FX GRAPH REPLACEMENT PASS ---
-
-def  _find_grouped_gemm_pattern(graph: fx.Graph) -> Optional[Tuple[fx.Node, fx.Node, int, List[fx.Node]]]:
+# Register as a custom operator for torch.compile
+@custom_op("moe::grouped_gemm", mutates_args=())
+def grouped_gemm(
+    tokens: torch.Tensor,  # [batch_size, d_model]
+    weights: torch.Tensor,  # [num_experts, d_model, d_ff]
+    top_k_expert_activation: torch.Tensor,  # [batch_size, top_k]
+) -> torch.Tensor:  # [batch_size * top_k, d_ff]
     """
-    Matcher to find the specific pattern created by SimpleGroupedPattern.
-    Returns: (Input_A_Node, Input_B_Node, Num_Groups, Nodes_To_Delete)
+    Perform grouped GEMM for MoE expert dispatch.
     """
-    nodes_to_delete = []
+    batch_size, d_model = tokens.shape
+    num_experts, _, d_ff = weights.shape
+    top_k = top_k_expert_activation.shape[1]
     
-    for node in reversed(graph.nodes):
-        if node.op == 'call_function' and node.target == torch.cat:
-            cat_node = node
-            cat_inputs = cat_node.args[0]
-            
-            if not isinstance(cat_inputs, tuple) or not all(isinstance(n, fx.Node) for n in cat_inputs):
-                continue
-
-            num_groups = len(cat_inputs)
-            matmul_nodes = []
-            
-            # Check if all inputs to cat are matmuls
-            for matmul_node in cat_inputs:
-                if matmul_node.op == 'call_function' and matmul_node.target == torch.matmul:
-                    matmul_nodes.append(matmul_node)
-                else:
-                    nodes_to_delete.clear()
-                    continue
-            
-            if len(matmul_nodes) != num_groups:
-                continue
-
-            # Identify B_GROUP (weight) and A_INPUT (original tensor)
-            b_group_node = matmul_nodes[0].args[1]
-            a_split_node = matmul_nodes[0].args[0].args[0] 
-            
-            if a_split_node.target != torch.split:
-                 continue
-            
-            a_node = a_split_node.args[0]
-            
-            if b_group_node.op != 'get_attr':
-                continue
-            
-            # Pattern found: build the list of nodes to remove
-            nodes_to_delete.append(cat_node)
-            nodes_to_delete.append(a_split_node)
-            nodes_to_delete.extend(matmul_nodes)
-            
-            # Add the intermediate 'getitem' nodes (slices)
-            for matmul_node in matmul_nodes:
-                getitem_node = matmul_node.args[0]
-                if getitem_node.target == operator.getitem:
-                    nodes_to_delete.append(getitem_node)
-            
-            return (a_node, b_group_node, num_groups, nodes_to_delete)
+    # Flatten expert activations and sort by expert id
+    flat_expert_ids = top_k_expert_activation.reshape(-1)  # [batch_size * top_k]
+    sorted_indices = torch.argsort(flat_expert_ids)
+    sorted_expert_ids = flat_expert_ids[sorted_indices]
     
-    return None
-
-def grouped_gemm_replacement_pass(graph_module: fx.GraphModule) -> fx.GraphModule:
-    """FX pass to replace the grouped GEMM pattern with the custom function."""
-    graph = graph_module.graph
-    new_graph = fx.Graph()
-    node_map: Dict[fx.Node, fx.Node] = {}
+    # Create sorted token ids (which tokens go to which position)
+    token_ids = torch.arange(batch_size * top_k, device=tokens.device)
+    sorted_token_ids = token_ids[sorted_indices]
     
-    pattern_match = _find_grouped_gemm_pattern(graph)
-
-    print(pattern_match)
+    # Pad to block size
+    BLOCK_SIZE_M = 64
+    num_tokens = batch_size * top_k
+    num_tokens_padded = ((num_tokens + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M) * BLOCK_SIZE_M
+    padding = num_tokens_padded - num_tokens
     
-    if pattern_match is None:
-        # If pattern not found, just copy the graph
-        for node in graph.nodes:
-            new_node = new_graph.node_copy(node, lambda x: node_map.get(x, x))
-            node_map[node] = new_node
-        new_graph.lint()
-        return graph_module
-        
-    print(f"[PASS] Found Grouped GEMM Pattern! Replacing with {GROUPED_GEMM_FUNCTION.__name__}.")
-        
-    (input_a_node, input_b_group_node, num_groups, nodes_to_delete) = pattern_match
-    nodes_to_delete_set = set(nodes_to_delete)
+    if padding > 0:
+        sorted_token_ids = torch.cat([
+            sorted_token_ids,
+            torch.full((padding,), num_tokens, device=tokens.device, dtype=torch.int64)
+        ])
+        sorted_expert_ids = torch.cat([
+            sorted_expert_ids,
+            torch.full((padding,), -1, device=tokens.device, dtype=sorted_expert_ids.dtype)
+        ])
     
-    # Get the original output node (torch.cat) for remapping downstream users
-    cat_node = [n for n in nodes_to_delete if n.target == torch.cat][0]
-
-    # Iterate and copy/replace
-    for node in graph.nodes:
-        if node in nodes_to_delete_set:
-            continue
-
-        # Copy non-pattern nodes
-        new_node = new_graph.node_copy(node, lambda x: node_map.get(x, x))
-        node_map[node] = new_node
-        
-        # When we process the last of the dependencies, insert the replacement call
-        # We use input_b_group_node as a trigger for insertion.
-        if node == input_b_group_node: 
-            
-            # 1. Map old inputs to the new graph's nodes
-            new_a = node_map[input_a_node]
-            new_b_group = node_map[input_b_group_node]
-            
-            # 2. Call the custom, fused operator!
-            with new_graph.inserting_after(new_b_group):
-                new_replacement_node = new_graph.call_function(
-                    GROUPED_GEMM_FUNCTION, (new_a, new_b_group, num_groups)
-                )
-            
-            # 3. CRITICAL: Map the original pattern output node (cat_node) 
-            # to the new replacement node.
-            node_map[cat_node] = new_replacement_node
-
-    # Finalize and compile the new graph
-    new_graph.lint()
-    graph_module.graph = new_graph
-    graph_module.recompile()
+    # Create expert ids per block
+    num_blocks = num_tokens_padded // BLOCK_SIZE_M
+    expert_ids_per_block = sorted_expert_ids[::BLOCK_SIZE_M][:num_blocks]
     
-    return graph_module
+    # Allocate output
+    output = torch.zeros(num_tokens_padded, d_ff, device=tokens.device, dtype=tokens.dtype)
+    
+    # Kernel launch parameters
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    
+    num_pid_m = triton.cdiv(num_tokens_padded, BLOCK_SIZE_M)
+    num_pid_n = triton.cdiv(d_ff, BLOCK_SIZE_N)
+    grid = (num_pid_m * num_pid_n,)
+    
+    num_tokens_post_padded_ptr = torch.tensor([num_tokens_padded], device=tokens.device, dtype=torch.int32)
+    
+    # Launch kernel
+    grouped_gemm_kernel[grid](
+        tokens,
+        weights,
+        output,
+        sorted_token_ids,
+        expert_ids_per_block,
+        num_tokens_post_padded_ptr,
+        d_ff,  # N
+        d_model,  # K
+        num_tokens_padded,  # EM
+        num_tokens,  # num_valid_tokens
+        tokens.stride(0),  # stride_am
+        tokens.stride(1),  # stride_ak
+        weights.stride(0),  # stride_be
+        weights.stride(1),  # stride_bk
+        weights.stride(2),  # stride_bn
+        output.stride(0),  # stride_cm
+        output.stride(1),  # stride_cn
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        top_k=top_k,
+    )
+    
+    # Return only valid outputs (remove padding)
+    return output[:num_tokens]
 
-# -------------------------------------------------------------------
 
-# --- 4. COMPILATION INTEGRATION ---
 
-def custom_moe_compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
+
+@register_fake("moe::grouped_gemm")
+def grouped_gemm_fake(
+    tokens: torch.Tensor,
+    weights: torch.Tensor,
+    top_k_expert_activation: torch.Tensor,
+) -> torch.Tensor:
     """
-    Custom Inductor backend that applies the graph pass before execution.
-    FIXED: Returns the transformed module's forward method instead of calling
-    the unstable torch._inductor.compile_fx.
+    Fake implementation for torch.compile meta analysis.
+    Returns a tensor with the correct output shape without actual computation.
     """
-    # 1. Apply your custom pass
-    gm_transformed = grouped_gemm_replacement_pass(gm)
+    batch_size = tokens.shape[0]
+    top_k = top_k_expert_activation.shape[1]
+    d_ff = weights.shape[2]
     
-    # 2. Hand off the transformed graph. The backend must return a callable.
-    # Returning gm_transformed.forward satisfies the contract for now.
-    return gm_transformed.forward
+    # Return empty tensor with correct shape
+    return tokens.new_empty((batch_size * top_k, d_ff))
 
 
-if __name__ == '__main__':
-    print("--- Grouped GEMM FX Pass Demo ---")
+def setup_grouped_gemm_autograd():
+    """
+    Setup autograd support for the custom operator.
+    """
+    from torch.library import register_autograd
     
-    # --- Setup ---
-    BATCH_SIZE = 8
-    IN_FEATURES = 16
-    OUT_FEATURES = 32
-    NUM_GROUPS = 2
+    @register_autograd("moe::grouped_gemm", "default")
+    def grouped_gemm_backward(ctx, grad_output):
+        """
+        Backward pass for grouped_gemm.
+        For now, returns None gradients. Implement actual gradients if needed.
+        """
+        # grad_tokens: [batch_size, d_model]
+        # grad_weights: [num_experts, d_model, d_ff]
+        # grad_top_k_expert_activation: None (discrete, not differentiable)
+        return None, None, None
+
+
+# Call setup to register backward pass
+# setup_grouped_gemm_autograd()
+
+
+# Unit test
+if __name__ == "__main__":
+    print("Running unit test for grouped_gemm_op...")
     
-    # Create the model instance
-    model = SimpleGroupedPattern(IN_FEATURES, OUT_FEATURES, NUM_GROUPS)
+    # Test parameters
+    batch_size = 16
+    d_model = 64
+    d_ff = 128
+    num_experts = 4
+    top_k = 2
     
-    # Input tensor (batch size must be divisible by NUM_GROUPS for this demo)
-    x = torch.randn(BATCH_SIZE, IN_FEATURES)
+    # Create test inputs
+    torch.manual_seed(42)
+    tokens = torch.randn(batch_size, d_model, device='cuda', dtype=torch.float32)
+    weights = torch.randn(num_experts, d_model, d_ff, device='cuda', dtype=torch.float32)
+    top_k_expert_activation = torch.randint(0, num_experts, (batch_size, top_k), device='cuda')
     
-    # 1. Verify Eager mode output
-    eager_output = model(x)
-    print(f"\n[Eager] Model Output shape: {eager_output.shape}")
+    print(f"Tokens shape: {tokens.shape}")
+    print(f"Weights shape: {weights.shape}")
+    print(f"Expert activation shape: {top_k_expert_activation.shape}")
+    print(f"Expert assignments (first 4 tokens): {top_k_expert_activation[:4].tolist()}")
     
-    # 2. Trace the model to see the initial graph
-    traced_model = fx.symbolic_trace(model)
-    print("\n[Initial FX Graph (Eager Pattern)]")
-    traced_model.graph.print_tabular()
+    # Test 1: Original implementation
+    print("\n" + "="*50)
+    print("Test 1: Original grouped_gemm_op")
+    print("="*50)
+    output = grouped_gemm(tokens, weights, top_k_expert_activation)
+    print(f"Output shape: {output.shape}")
+    assert output.shape == (batch_size * top_k, d_ff), f"Expected shape {(batch_size * top_k, d_ff)}, got {output.shape}"
     
-    # 3. Compile the model with the custom pass
+    # Verify correctness by computing reference output
+    print("\nVerifying correctness against naive implementation...")
+    reference_output = torch.zeros(batch_size * top_k, d_ff, device='cuda', dtype=torch.float32)
+    
+    idx = 0
+    for i in range(batch_size):
+        for k in range(top_k):
+            expert_id = top_k_expert_activation[i, k].item()
+            # token[i] @ weights[expert_id] -> [d_model] @ [d_model, d_ff] = [d_ff]
+            reference_output[idx] = tokens[i] @ weights[expert_id]
+            idx += 1
+    
+    # Check if outputs match
+    max_diff = (output - reference_output).abs().max().item()
+    mean_diff = (output - reference_output).abs().mean().item()
+    
+    print(f"Max difference: {max_diff:.6e}")
+    print(f"Mean difference: {mean_diff:.6e}")
+    
+    # Allow small numerical differences due to floating point
+    tolerance = 1e-4
+    if max_diff < tolerance:
+        print(f"✓ Test PASSED! Max difference {max_diff:.6e} is within tolerance {tolerance}")
+    else:
+        print(f"✗ Test FAILED! Max difference {max_diff:.6e} exceeds tolerance {tolerance}")
+        print(f"\nSample outputs (first 3):")
+        print(f"Triton output: {output[:3, :5]}")
+        print(f"Reference output: {reference_output[:3, :5]}")
+    
+    # Test 2: Custom operator
+    print("\n" + "="*50)
+    print("Test 2: Custom operator (mylib::grouped_gemm)")
+    print("="*50)
+    output_custom = torch.ops.moe.grouped_gemm(tokens, weights, top_k_expert_activation)
+    print(f"Output shape: {output_custom.shape}")
+    
+    max_diff_custom = (output_custom - reference_output).abs().max().item()
+    print(f"Max difference from reference: {max_diff_custom:.6e}")
+    
+    if max_diff_custom < tolerance:
+        print(f"✓ Custom operator test PASSED!")
+    else:
+        print(f"✗ Custom operator test FAILED!")
+    
+    # Test 3: With torch.compile
+    print("\n" + "="*50)
+    print("Test 3: With torch.compile")
+    print("="*50)
+    
+    def model_with_grouped_gemm(tokens, weights, experts):
+        return torch.ops.moe.grouped_gemm(tokens, weights, experts)
+    
     try:
-        compiled_model = torch.compile(model, backend=custom_moe_compiler)
-        compiled_output = compiled_model(x)
-        print(f"\n[Compiled] Model Output shape: {compiled_output.shape}")
-
-        # 4. Verify correctness
-        assert torch.allclose(eager_output, compiled_output, atol=1e-6), "Compiled output does not match Eager output!"
-        print("\n[SUCCESS] Compiled output matches Eager output.")
+        compiled_model = torch.compile(model_with_grouped_gemm, fullgraph=True)
+        output_compiled = compiled_model(tokens, weights, top_k_expert_activation)
+        print(f"Output shape: {output_compiled.shape}")
         
-        # 5. Show Transformed Graph by running the pass manually (for visualization)
-        transformed_model = grouped_gemm_replacement_pass(fx.symbolic_trace(model))
+        max_diff_compiled = (output_compiled - reference_output).abs().max().item()
+        print(f"Max difference from reference: {max_diff_compiled:.6e}")
         
-        print("\n[Transformed FX Graph (Fusing Applied)]")
-        transformed_model.graph.print_tabular()
-        
+        if max_diff_compiled < tolerance:
+            print(f"✓ torch.compile test PASSED!")
+        else:
+            print(f"✗ torch.compile test FAILED!")
     except Exception as e:
-        print(f"\n[ERROR] Could not complete torch.compile demo.")
-        print(f"Error details: {e}")
+        print(f"✗ torch.compile test failed with error: {e}")
+    
+    # Additional shape tests
+    print("\n" + "="*50)
+    print("Test 4: Different configurations")
+    print("="*50)
+    
+    test_configs = [
+        (4, 32, 64, 2, 1),   # Small batch, single expert per token
+        (8, 128, 256, 8, 3), # Larger with top-3
+        (1, 16, 32, 4, 2),   # Single token
+    ]
+    
+    for bs, dm, df, ne, tk in test_configs:
+        tokens_test = torch.randn(bs, dm, device='cuda', dtype=torch.float32)
+        weights_test = torch.randn(ne, dm, df, device='cuda', dtype=torch.float32)
+        experts_test = torch.randint(0, ne, (bs, tk), device='cuda')
+        
+        output_test = torch.ops.moe.grouped_gemm(tokens_test, weights_test, experts_test)
+        expected_shape = (bs * tk, df)
+        
+        if output_test.shape == expected_shape:
+            print(f"✓ Config (bs={bs}, d_model={dm}, d_ff={df}, experts={ne}, top_k={tk}): PASSED")
+        else:
+            print(f"✗ Config (bs={bs}, d_model={dm}, d_ff={df}, experts={ne}, top_k={tk}): FAILED")
+    
+    print("\n" + "="*50)
+    print("All tests completed!")
+    print("="*50)
