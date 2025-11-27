@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
+import torch.fx as fx
 
 try:
     from functorch.compile import aot_module # AOTAutograd: wrap module with aot_module
@@ -77,6 +78,39 @@ def cleanup_dist():
     dist.destroy_process_group()
 
 
+def apply_moe_single_layer_overlap_pass(gm: fx.GraphModule) -> fx.GraphModule:
+    """
+    Move the last all_to_all_single to immediately follow its input so compute/comm overlap.
+    """
+    graph = gm.graph
+    comm_node = None
+    target_op = torch.ops._c10d_functional.all_to_all_single.default
+
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target == target_op:
+            comm_node = node
+
+    if comm_node is None:
+        return gm
+
+    comm_input = comm_node.args[0]
+    if not isinstance(comm_input, fx.Node):
+        return gm
+
+    kwargs_copy = dict(comm_node.kwargs) if comm_node.kwargs else {}
+
+    with graph.inserting_after(comm_input):
+        new_comm = graph.call_function(target_op, comm_node.args, kwargs_copy)
+
+    new_comm.meta = dict(getattr(comm_node, "meta", {}))
+    new_comm.name = comm_node.name
+    comm_node.replace_all_uses_with(new_comm)
+    graph.erase_node(comm_node)
+    graph.lint()
+    gm.recompile()
+    return gm
+
+
 # ------------------------------------
 # 3. AOTAutograd compile module + print FW/BW graphs
 # ------------------------------------
@@ -98,12 +132,16 @@ def make_aot_compiled_model(model: AllToAllMoE, rank: int) -> nn.Module:
 
     def bw_compiler(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]):
         if rank == 0:
-            print("=" * 80)
-            print("AOTAutograd BACKWARD GRAPH (bw_graph):")
-            print("=" * 80)
+            print("=== BEFORE PASS ===")
             print(gm.graph)
-            print("=" * 80)
-        return gm.forward
+
+        new_gm = apply_moe_single_layer_overlap_pass(gm)
+
+        if rank == 0:
+            print("=== AFTER PASS ===")
+            print(new_gm.graph)
+
+        return new_gm.forward
 
     # aot_module lifts params/buffers as inputs and invokes aot_function,
     # automatically handling FakeTensor so no "params are real tensor" errors occur.
