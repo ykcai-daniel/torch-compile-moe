@@ -7,19 +7,16 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 import torch.fx as fx
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
+# --------- AOTAutograd import，确保有 make_boxed_func ----------
 try:
-    from functorch.compile import aot_module # AOTAutograd: wrap module with aot_module
+    from functorch.compile import aot_module, make_boxed_func  # 新版 PyTorch
 except Exception:
-    from torch._functorch.aot_autograd import aot_module # PyTorch 2.x
+    from torch._functorch.aot_autograd import aot_module, make_boxed_func  # 旧版路径
 
 
-# -------------------------------
-# 1. Traceable MoE with all_to_all
-# -------------------------------
 class AllToAllMoE(nn.Module):
-    """
-    all_to_all -> MLP -> all_to_all
-    """
     def __init__(self, hidden_dim: int, ffn_dim: int):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -29,9 +26,6 @@ class AllToAllMoE(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (local_tokens, hidden_dim) local tokens on each rank
-        """
         assert dist.is_initialized(), "Need dist.init_process_group first!"
         world_size = dist.get_world_size()
 
@@ -40,38 +34,23 @@ class AllToAllMoE(nn.Module):
         chunk = local_tokens // world_size
         split_sizes = [chunk] * world_size
 
-        group = dist.group.WORLD.group_name # # Use WORLD group name as the group identifier
+        group = dist.group.WORLD.group_name
 
-        # 1) all-to-all gather tokens
         x_gathered = ft_c.all_to_all_single_autograd(
-            x,
-            split_sizes,  # input_split_sizes
-            split_sizes,  # output_split_sizes
-            group,
+            x, split_sizes, split_sizes, group,
         )
-
-        # 2) MLP expert
         y = self.mlp(x_gathered)
-
-        # 3) all-to-all scatter tokens back
         y_scattered = ft_c.all_to_all_single_autograd(
-            y,
-            split_sizes,
-            split_sizes,
-            group,
+            y, split_sizes, split_sizes, group,
         )
-
         return y_scattered
 
 
-# -----------------------
-# 2. Distributed init/cleanup
-# -----------------------
 def setup_dist():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    print(f"[rank {dist.get_rank()}] init done, using cuda:{local_rank}")
+    print(f"[rank {dist.get_rank()}] init done, using cuda:{local_rank}", flush=True)
 
 
 def cleanup_dist():
@@ -79,9 +58,6 @@ def cleanup_dist():
 
 
 def apply_moe_single_layer_overlap_pass(gm: fx.GraphModule) -> fx.GraphModule:
-    """
-    Move the last all_to_all_single to immediately follow its input so compute/comm overlap.
-    """
     graph = gm.graph
     comm_node = None
     target_op = torch.ops._c10d_functional.all_to_all_single.default
@@ -111,47 +87,60 @@ def apply_moe_single_layer_overlap_pass(gm: fx.GraphModule) -> fx.GraphModule:
     return gm
 
 
-# ------------------------------------
-# 3. AOTAutograd compile module + print FW/BW graphs
-# ------------------------------------
-def make_aot_compiled_model(model: AllToAllMoE, rank: int) -> nn.Module:
-    """
-    Use aot_module to compile AllToAllMoE with AOTAutograd:
-    - fw_compiler prints forward FX graph
-    - bw_compiler prints backward FX graph
-    The returned compiled_model(x) behaves the same but both fwd & bwd use AOT graphs.
-    """
+def make_aot_compiled_model(model: AllToAllMoE, rank: int, enable_overlap_pass: bool) -> nn.Module:
     def fw_compiler(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]):
         if rank == 0:
             print("=" * 80)
             print("AOTAutograd FORWARD GRAPH (fw_graph):")
             print("=" * 80)
             print(gm.graph)
-            print("=" * 80)
-        return gm.forward
+            print("=" * 80, flush=True)
+        return make_boxed_func(gm.forward)
 
     def bw_compiler(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]):
         if rank == 0:
             print("=== BEFORE PASS ===")
             print(gm.graph)
 
-        new_gm = apply_moe_single_layer_overlap_pass(gm)
+        new_gm = gm
+        if enable_overlap_pass:
+            new_gm = apply_moe_single_layer_overlap_pass(gm)
 
         if rank == 0:
             print("=== AFTER PASS ===")
-            print(new_gm.graph)
+            print(new_gm.graph, flush=True)
 
-        return new_gm.forward
+        return make_boxed_func(new_gm.forward)
 
-    # aot_module lifts params/buffers as inputs and invokes aot_function,
-    # automatically handling FakeTensor so no "params are real tensor" errors occur.
     compiled_model = aot_module(
         model,
         fw_compiler=fw_compiler,
         bw_compiler=bw_compiler,
     )
-
     return compiled_model
+
+
+def train_one_step_with_profiler(compiled_model, x, logdir: str, rank: int):
+    torch.cuda.synchronize()
+
+    rank_logdir = os.path.join(logdir, f"rank{rank}")
+    os.makedirs(rank_logdir, exist_ok=True)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(rank_logdir),
+    ) as prof:
+        with record_function("moe_train_step"):
+            out = compiled_model(x)
+            loss = out.sum()
+            loss.backward()
+        torch.cuda.synchronize()
+        prof.step()
+    if rank == 0:
+        print(f"[rank 0] profile written to {rank_logdir}", flush=True)
 
 
 def main():
@@ -163,24 +152,52 @@ def main():
 
     hidden_dim = 256
     ffn_dim = 1024
-    local_tokens = 4 * world_size  # number of tokens per rank
+    local_tokens = 4 * world_size
 
-    # Original MoE model
+    # ---------- BEFORE PASS ----------
     model = AllToAllMoE(hidden_dim, ffn_dim).to(device)
-
-    # AOTAutograd-compiled model (prints fw_graph / bw_graph)
-    compiled_model = make_aot_compiled_model(model, rank).to(device)
-
-    # Input: (local_tokens, hidden_dim)
     x = torch.randn(local_tokens, hidden_dim, device=device, requires_grad=True)
 
-    # Forward + backward
-    out = compiled_model(x)
+    compiled_before = make_aot_compiled_model(model, rank, enable_overlap_pass=False).to(device)
+
+    out = compiled_before(x)
     loss = out.sum()
     loss.backward()
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"[rank 0] Warmup BEFORE done, loss = {loss.item():.4f}", flush=True)
+
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad = None
 
     if rank == 0:
-        print(f"[rank {rank}] Done. loss = {loss.item():.4f}")
+        print("[rank 0] Profiling BEFORE pass...", flush=True)
+    train_one_step_with_profiler(compiled_before, x, logdir="./log_before", rank=rank)
+
+    # ---------- AFTER PASS ----------
+    model2 = AllToAllMoE(hidden_dim, ffn_dim).to(device)
+    x2 = torch.randn(local_tokens, hidden_dim, device=device, requires_grad=True)
+
+    compiled_after = make_aot_compiled_model(model2, rank, enable_overlap_pass=True).to(device)
+
+    out2 = compiled_after(x2)
+    loss2 = out2.sum()
+    loss2.backward()
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"[rank 0] Warmup AFTER done, loss = {loss2.item():.4f}", flush=True)
+
+    for p in model2.parameters():
+        if p.grad is not None:
+            p.grad = None
+
+    if rank == 0:
+        print("[rank 0] Profiling AFTER pass...", flush=True)
+    train_one_step_with_profiler(compiled_after, x2, logdir="./log_after", rank=rank)
+
+    if rank == 0:
+        print("[rank 0] Done profiling BEFORE & AFTER.", flush=True)
 
     cleanup_dist()
 
