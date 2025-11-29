@@ -5,11 +5,14 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
+import torch.fx as fx
+
+from torch.profiler import profile, record_function, ProfilerActivity
 
 try:
-    from functorch.compile import aot_module 
+    from functorch.compile import aot_module, make_boxed_func 
 except Exception:
-    from torch._functorch.aot_autograd import aot_module
+    from torch._functorch.aot_autograd import aot_module, make_boxed_func 
 
 
 # -------------------------------
@@ -93,26 +96,131 @@ def cleanup_dist():
 # ------------------------------------
 # 3. AOTAutograd compile module + print BW graph only
 # ------------------------------------
-def make_aot_compiled_model(model: nn.Module, rank: int) -> nn.Module:
+def make_aot_compiled_model(model: ThreeLayerAllToAllMoE, rank: int, enable_overlap_pass: bool) -> nn.Module:
     def fw_compiler(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]):
-        return gm.forward
+        if rank == 0:
+            print("=" * 80)
+            print("AOTAutograd FORWARD GRAPH (fw_graph):")
+            print("=" * 80)
+            print(gm.graph)
+            print("=" * 80, flush=True)
+        return make_boxed_func(gm.forward)
 
     def bw_compiler(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]):
         if rank == 0:
-            print("=" * 80)
-            print("AOTAutograd BACKWARD GRAPH (bw_graph):")
-            print("=" * 80)
+            print("=== BEFORE PASS ===")
             print(gm.graph)
-            print("=" * 80)
-        return gm.forward
+
+        new_gm = gm
+        if enable_overlap_pass:
+            new_gm = apply_moe_overlap_pass(gm)
+
+        if rank == 0:
+            print("=== AFTER PASS ===")
+            print(new_gm.graph, flush=True)
+
+        return make_boxed_func(new_gm.forward)
 
     compiled_model = aot_module(
         model,
         fw_compiler=fw_compiler,
         bw_compiler=bw_compiler,
     )
-
     return compiled_model
+
+def apply_moe_overlap_pass(gm: fx.GraphModule) -> fx.GraphModule:
+    """
+    Generalized MoE backward‐overlap pass.
+
+    For arbitrary MoE backward graphs:
+      - Identify all patterns of:  all_to_all_single(mm_*, split_sizes..., group)
+      - For each communication node, move it immediately after its corresponding mm_* node
+      - Do NOT modify the position of wait_tensor nodes
+
+    The goal is to launch communication as early as possible so that subsequent
+    compute that does not depend on the communication can overlap with it.
+    """
+
+    graph = gm.graph
+    target_comm = torch.ops._c10d_functional.all_to_all_single.default
+    target_mm = torch.ops.aten.mm.default
+
+    # 1. Collect a snapshot of all all_to_all_single nodes
+    comm_nodes = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function" and node.target == target_comm
+    ]
+
+    if not comm_nodes:
+        return gm
+
+    # 2. Process each communication node
+    for comm_node in comm_nodes:
+        # The first argument is the communication input. It may be:
+        # placeholder, mm node, wait_tensor node, etc.
+        if not comm_node.args:
+            continue
+        comm_input = comm_node.args[0]
+
+        # Handle only the specific pattern where the input is an mm node (typical dW)
+        if not isinstance(comm_input, fx.Node):
+            # e.g., the top-level all_to_all_single(tangents_1, ...) whose input is a placeholder
+            continue
+        if not (
+            comm_input.op == "call_function"
+            and comm_input.target == target_mm
+        ):
+            # e.g., all_to_all_single(wait_tensor_k, ...) — not handled in this prototype
+            continue
+
+        # If comm_node already follows comm_input, you could skip,
+        # but recreating it is safe and simpler.
+        kwargs_copy = dict(comm_node.kwargs) if comm_node.kwargs else {}
+
+        # Insert new comm node right after the mm_* node
+        with graph.inserting_after(comm_input):
+            new_comm = graph.call_function(
+                target_comm,
+                comm_node.args,
+                kwargs_copy,
+            )
+
+        # Copy meta/name for easier debugging
+        new_comm.meta = dict(getattr(comm_node, "meta", {}))
+        new_comm.name = comm_node.name
+
+        # Replace all uses of old comm with the new comm (typically consumed by wait_tensor)
+        comm_node.replace_all_uses_with(new_comm)
+
+        # Remove the old communication node
+        graph.erase_node(comm_node)
+
+    graph.lint()
+    gm.recompile()
+    return gm
+
+def train_one_step_with_profiler(compiled_model, x, logdir: str, rank: int):
+    torch.cuda.synchronize()
+
+    rank_logdir = os.path.join(logdir, f"rank{rank}")
+    os.makedirs(rank_logdir, exist_ok=True)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(rank_logdir),
+    ) as prof:
+        with record_function("moe_train_step"):
+            out = compiled_model(x)
+            loss = out.sum()
+            loss.backward()
+        torch.cuda.synchronize()
+        prof.step()
+    if rank == 0:
+        print(f"[rank 0] profile written to {rank_logdir}", flush=True)
 
 
 def main():
@@ -126,19 +234,51 @@ def main():
     ffn_dim = 1024
     local_tokens = 4 * world_size  # number of tokens per rank
 
+    # ---------- BEFORE PASS ----------
     model = ThreeLayerAllToAllMoE(hidden_dim, ffn_dim, num_layers=3).to(device)
-    compiled_model = make_aot_compiled_model(model, rank).to(device)
-
-    # Input: (local_tokens, hidden_dim)
     x = torch.randn(local_tokens, hidden_dim, device=device, requires_grad=True)
 
-    # Forward + backward
-    out = compiled_model(x)
+    compiled_before = make_aot_compiled_model(model, rank, enable_overlap_pass=False).to(device)
+    # compiled_model = make_aot_compiled_model(model, rank).to(device)
+
+    out = compiled_before(x)
     loss = out.sum()
     loss.backward()
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"[rank 0] Warmup BEFORE done, loss = {loss.item():.4f}", flush=True)
+
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad = None
 
     if rank == 0:
-        print(f"[rank {rank}] Done. loss = {loss.item():.4f}")
+        print("[rank 0] Profiling BEFORE pass...", flush=True)
+    train_one_step_with_profiler(compiled_before, x, logdir="./log_before", rank=rank)
+
+    # ---------- AFTER PASS ----------
+    model2 = ThreeLayerAllToAllMoE(hidden_dim, ffn_dim).to(device)
+    x2 = torch.randn(local_tokens, hidden_dim, device=device, requires_grad=True)
+
+    compiled_after = make_aot_compiled_model(model2, rank, enable_overlap_pass=True).to(device)
+
+    out2 = compiled_after(x2)
+    loss2 = out2.sum()
+    loss2.backward()
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"[rank 0] Warmup AFTER done, loss = {loss2.item():.4f}", flush=True)
+
+    for p in model2.parameters():
+        if p.grad is not None:
+            p.grad = None
+
+    if rank == 0:
+        print("[rank 0] Profiling AFTER pass...", flush=True)
+    train_one_step_with_profiler(compiled_after, x2, logdir="./log_after", rank=rank)
+
+    if rank == 0:
+        print("[rank 0] Done profiling BEFORE & AFTER.", flush=True)
 
     cleanup_dist()
 

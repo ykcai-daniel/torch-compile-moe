@@ -9,11 +9,10 @@ import torch.fx as fx
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# --------- AOTAutograd import，确保有 make_boxed_func ----------
 try:
-    from functorch.compile import aot_module, make_boxed_func  # 新版 PyTorch
+    from functorch.compile import aot_module, make_boxed_func 
 except Exception:
-    from torch._functorch.aot_autograd import aot_module, make_boxed_func  # 旧版路径
+    from torch._functorch.aot_autograd import aot_module, make_boxed_func 
 
 
 class AllToAllMoE(nn.Module):
@@ -57,31 +56,103 @@ def cleanup_dist():
     dist.destroy_process_group()
 
 
-def apply_moe_single_layer_overlap_pass(gm: fx.GraphModule) -> fx.GraphModule:
+# def apply_moe_single_layer_overlap_pass(gm: fx.GraphModule) -> fx.GraphModule:
+#     graph = gm.graph
+#     comm_node = None
+#     target_op = torch.ops._c10d_functional.all_to_all_single.default
+
+#     for node in graph.nodes:
+#         if node.op == "call_function" and node.target == target_op:
+#             comm_node = node
+
+#     if comm_node is None:
+#         return gm
+
+#     comm_input = comm_node.args[0]
+#     if not isinstance(comm_input, fx.Node):
+#         return gm
+
+#     kwargs_copy = dict(comm_node.kwargs) if comm_node.kwargs else {}
+
+#     with graph.inserting_after(comm_input):
+#         new_comm = graph.call_function(target_op, comm_node.args, kwargs_copy)
+
+#     new_comm.meta = dict(getattr(comm_node, "meta", {}))
+#     new_comm.name = comm_node.name
+#     comm_node.replace_all_uses_with(new_comm)
+#     graph.erase_node(comm_node)
+#     graph.lint()
+#     gm.recompile()
+#     return gm
+
+def apply_moe_overlap_pass(gm: fx.GraphModule) -> fx.GraphModule:
+    """
+    Generalized MoE backward‐overlap pass.
+
+    For arbitrary MoE backward graphs:
+      - Identify all patterns of:  all_to_all_single(mm_*, split_sizes..., group)
+      - For each communication node, move it immediately after its corresponding mm_* node
+      - Do NOT modify the position of wait_tensor nodes
+
+    The goal is to launch communication as early as possible so that subsequent
+    compute that does not depend on the communication can overlap with it.
+    """
+
     graph = gm.graph
-    comm_node = None
-    target_op = torch.ops._c10d_functional.all_to_all_single.default
+    target_comm = torch.ops._c10d_functional.all_to_all_single.default
+    target_mm = torch.ops.aten.mm.default
 
-    for node in graph.nodes:
-        if node.op == "call_function" and node.target == target_op:
-            comm_node = node
+    # 1. Collect a snapshot of all all_to_all_single nodes
+    comm_nodes = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function" and node.target == target_comm
+    ]
 
-    if comm_node is None:
+    if not comm_nodes:
         return gm
 
-    comm_input = comm_node.args[0]
-    if not isinstance(comm_input, fx.Node):
-        return gm
+    # 2. Process each communication node
+    for comm_node in comm_nodes:
+        # The first argument is the communication input. It may be:
+        # placeholder, mm node, wait_tensor node, etc.
+        if not comm_node.args:
+            continue
+        comm_input = comm_node.args[0]
 
-    kwargs_copy = dict(comm_node.kwargs) if comm_node.kwargs else {}
+        # Handle only the specific pattern where the input is an mm node (typical dW)
+        if not isinstance(comm_input, fx.Node):
+            # e.g., the top-level all_to_all_single(tangents_1, ...) whose input is a placeholder
+            continue
+        if not (
+            comm_input.op == "call_function"
+            and comm_input.target == target_mm
+        ):
+            # e.g., all_to_all_single(wait_tensor_k, ...) — not handled in this prototype
+            continue
 
-    with graph.inserting_after(comm_input):
-        new_comm = graph.call_function(target_op, comm_node.args, kwargs_copy)
+        # If comm_node already follows comm_input, you could skip,
+        # but recreating it is safe and simpler.
+        kwargs_copy = dict(comm_node.kwargs) if comm_node.kwargs else {}
 
-    new_comm.meta = dict(getattr(comm_node, "meta", {}))
-    new_comm.name = comm_node.name
-    comm_node.replace_all_uses_with(new_comm)
-    graph.erase_node(comm_node)
+        # Insert new comm node right after the mm_* node
+        with graph.inserting_after(comm_input):
+            new_comm = graph.call_function(
+                target_comm,
+                comm_node.args,
+                kwargs_copy,
+            )
+
+        # Copy meta/name for easier debugging
+        new_comm.meta = dict(getattr(comm_node, "meta", {}))
+        new_comm.name = comm_node.name
+
+        # Replace all uses of old comm with the new comm (typically consumed by wait_tensor)
+        comm_node.replace_all_uses_with(new_comm)
+
+        # Remove the old communication node
+        graph.erase_node(comm_node)
+
     graph.lint()
     gm.recompile()
     return gm
@@ -104,7 +175,7 @@ def make_aot_compiled_model(model: AllToAllMoE, rank: int, enable_overlap_pass: 
 
         new_gm = gm
         if enable_overlap_pass:
-            new_gm = apply_moe_single_layer_overlap_pass(gm)
+            new_gm = apply_moe_overlap_pass(gm)
 
         if rank == 0:
             print("=== AFTER PASS ===")
