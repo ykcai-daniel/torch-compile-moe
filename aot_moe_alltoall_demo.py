@@ -221,8 +221,8 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    hidden_dim = 256
-    ffn_dim = 1024
+    hidden_dim = 1024
+    ffn_dim = 17408 # agree to big transformer model
     local_tokens = 4 * world_size
 
     # ---------- BEFORE PASS ----------
