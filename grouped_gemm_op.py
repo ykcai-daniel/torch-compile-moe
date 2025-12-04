@@ -4,6 +4,7 @@ import torch
 from typing import List
 from torch.library import custom_op, register_fake
 
+# Triton based MoE kernel from vllm
 @triton.jit
 def grouped_gemm_kernel(
     # Pointers to matrices
@@ -114,50 +115,170 @@ def grouped_gemm_kernel(
     c_mask = (offs_m[:, None] < num_tokens_post_padded) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
+
+def grouped_gemm_triton(
+    tokens: torch.Tensor,  # [batch_size, d_model]
+    weights: torch.Tensor,  # [num_experts, d_model, d_ff]
+    top_k_expert_activation: torch.Tensor,  # [batch_size, top_k]
+) -> torch.Tensor:  # [batch_size * top_k, d_ff]
+    batch_size, d_model = tokens.shape
+    num_experts, K, N = weights.shape  # [num_experts, d_model, d_ff]
+    top_k = top_k_expert_activation.shape[1]
+
+    # Flatten expert assignments: [batch_size * top_k]
+    flat_expert_ids = top_k_expert_activation.reshape(-1).to(torch.int32)
+
+    # Create token indices for each position
+    # For top_k=2: [0, 0, 1, 1, 2, 2, ...]
+    token_indices = torch.arange(batch_size, device=tokens.device).repeat_interleave(top_k)
+
+    # Sort by expert ID to group tokens processed by the same expert
+    sorted_indices = torch.argsort(flat_expert_ids)
+    sorted_expert_ids = flat_expert_ids[sorted_indices]
+    sorted_token_ids = token_indices[sorted_indices]
+
+    # Create sorted token IDs with top_k multiplier for indexing
+    # This allows the kernel to properly index into the flattened token space
+    sorted_token_ids_with_k = sorted_indices.to(torch.int64)
+
+    # Count tokens per expert and create block-level expert IDs
+    num_tokens_post_padded = len(sorted_expert_ids)
+
+    # Block configuration
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_K = 32
+    GROUP_SIZE_M = 8
+
+    num_blocks = (num_tokens_post_padded + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+
+    # Create expert ID for each block
+    expert_ids_per_block = torch.full((num_blocks,), -1, dtype=torch.int32, device=tokens.device)
+    for block_idx in range(num_blocks):
+        start_idx = block_idx * BLOCK_SIZE_M
+        if start_idx < num_tokens_post_padded:
+            expert_ids_per_block[block_idx] = sorted_expert_ids[start_idx]
+
+    # Allocate output (in sorted order)
+    sorted_output = torch.zeros(
+        num_tokens_post_padded, N, device=tokens.device, dtype=tokens.dtype
+    )
+
+    # Prepare pointers and metadata
+    num_tokens_post_padded_tensor = torch.tensor(
+        [num_tokens_post_padded], device=tokens.device, dtype=torch.int32
+    )
+
+    # Grid configuration
+    num_pid_n = (N + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    num_pid_m = (num_tokens_post_padded + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    grid = lambda META: (num_pid_m * num_pid_n,)
+
+    # Launch kernel
+    grouped_gemm_kernel[grid](
+        tokens,
+        weights,
+        sorted_output,
+        sorted_token_ids_with_k,
+        expert_ids_per_block,
+        num_tokens_post_padded_tensor,
+        N,  # d_ff
+        K,  # d_model
+        num_tokens_post_padded,  # EM
+        batch_size,  # num_valid_tokens
+        tokens.stride(0),  # stride_am
+        tokens.stride(1),  # stride_ak
+        weights.stride(0),  # stride_be
+        weights.stride(1),  # stride_bk
+        weights.stride(2),  # stride_bn
+        sorted_output.stride(0),  # stride_cm
+        sorted_output.stride(1),  # stride_cn
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        top_k=top_k,
+    )
+
+    # Unsort output to match original order
+    output = torch.zeros(batch_size * top_k, N, device=tokens.device, dtype=tokens.dtype)
+    output[sorted_indices] = sorted_output
+
+    return output
+
+
+# Naive PyTorch eager implementation
+def grouped_gemm_eager(
+    tokens: torch.Tensor,  # [batch_size, d_model]
+    weights: torch.Tensor,  # [num_experts, d_model, d_ff]
+    top_k_expert_activation: torch.Tensor,  # [batch_size, top_k]
+) -> torch.Tensor:  # [batch_size * top_k, d_ff]
+    """
+    Naive PyTorch eager mode implementation for grouped GEMM.
+    """
+    batch_size, d_model = tokens.shape
+    num_experts, _, d_ff = weights.shape
+    top_k = top_k_expert_activation.shape[1]
+
+    # Flatten the expert assignments to get all (token_idx, expert_id) pairs
+    # Shape: [batch_size * top_k]
+    flat_expert_ids = top_k_expert_activation.reshape(-1)
+
+    # Create indices to track which output position each computation goes to
+    output_indices = torch.arange(batch_size * top_k, device=tokens.device)
+
+    # Create token indices (which token each computation comes from)
+    # For top_k=2: [0, 0, 1, 1, 2, 2, ...]
+    token_indices = torch.arange(batch_size, device=tokens.device).repeat_interleave(top_k)
+
+    # Allocate output
+    output = torch.zeros(batch_size * top_k, d_ff, device=tokens.device, dtype=tokens.dtype)
+
+    # Process each expert
+    for expert_id in range(num_experts):
+        # Find all positions assigned to this expert
+        mask = flat_expert_ids == expert_id
+
+        if mask.any():
+            # Get the token indices that need this expert
+            selected_token_indices = token_indices[mask]
+
+            # Get the tokens for this expert
+            selected_tokens = tokens[selected_token_indices]  # [num_selected, d_model]
+
+            # Batch matrix multiply: [num_selected, d_model] @ [d_model, d_ff]
+            expert_output = selected_tokens @ weights[expert_id]  # [num_selected, d_ff]
+
+            # Place results in the correct output positions
+            output[mask] = expert_output
+
+    return output
+
+
 # Register as a custom operator for torch.compile
 @custom_op("moe::grouped_gemm", mutates_args=())
 def grouped_gemm(
     tokens: torch.Tensor,  # [batch_size, d_model]
     weights: torch.Tensor,  # [num_experts, d_model, d_ff]
     top_k_expert_activation: torch.Tensor,  # [batch_size, top_k]
+    use_triton: bool = False,
 ) -> torch.Tensor:  # [batch_size * top_k, d_ff]
-    batch_size, d_model = tokens.shape
-    num_experts, _, d_ff = weights.shape
-    top_k = top_k_expert_activation.shape[1]
-    
-    # Flatten the expert assignments to get all (token_idx, expert_id) pairs
-    # Shape: [batch_size * top_k]
-    flat_expert_ids = top_k_expert_activation.reshape(-1)
-    
-    # Create indices to track which output position each computation goes to
-    output_indices = torch.arange(batch_size * top_k, device=tokens.device)
-    
-    # Create token indices (which token each computation comes from)
-    # For top_k=2: [0, 0, 1, 1, 2, 2, ...]
-    token_indices = torch.arange(batch_size, device=tokens.device).repeat_interleave(top_k)
-    
-    # Allocate output
-    output = torch.zeros(batch_size * top_k, d_ff, device=tokens.device, dtype=tokens.dtype)
-    
-    # Process each expert
-    for expert_id in range(num_experts):
-        # Find all positions assigned to this expert
-        mask = flat_expert_ids == expert_id
-        
-        if mask.any():
-            # Get the token indices that need this expert
-            selected_token_indices = token_indices[mask]
-            
-            # Get the tokens for this expert
-            selected_tokens = tokens[selected_token_indices]  # [num_selected, d_model]
-            
-            # Batch matrix multiply: [num_selected, d_model] @ [d_model, d_ff]
-            expert_output = selected_tokens @ weights[expert_id]  # [num_selected, d_ff]
-            
-            # Place results in the correct output positions
-            output[mask] = expert_output
-    
-    return output
+    """
+    Grouped GEMM for MoE with optional Triton acceleration.
+
+    Args:
+        tokens: Input tokens [batch_size, d_model]
+        weights: Expert weights [num_experts, d_model, d_ff]
+        top_k_expert_activation: Expert assignments [batch_size, top_k]
+        use_triton: If True, use Triton kernel; otherwise use PyTorch eager
+
+    Returns:
+        Output tensor [batch_size * top_k, d_ff]
+    """
+    if use_triton:
+        return grouped_gemm_triton(tokens, weights, top_k_expert_activation)
+    else:
+        return grouped_gemm_eager(tokens, weights, top_k_expert_activation)
 
 def batched_grouped_gemm_backward(
     grad_output: torch.Tensor,  # [batch_size * top_k, d_ff]
@@ -231,20 +352,18 @@ def batched_grouped_gemm_backward(
     
     return grad_tokens, grad_weights, None
 
+# Meta Operator to be called in symbolic tracing.
 @register_fake("moe::grouped_gemm")
 def grouped_gemm_fake(
     tokens: torch.Tensor,
     weights: torch.Tensor,
     top_k_expert_activation: torch.Tensor,
+    use_triton: bool = False,
 ) -> torch.Tensor:
-    """
-    Fake implementation for torch.compile meta analysis.
-    Returns a tensor with the correct output shape without actual computation.
-    """
     batch_size = tokens.shape[0]
     top_k = top_k_expert_activation.shape[1]
     d_ff = weights.shape[2]
-    
+
     # Return empty tensor with correct shape
     return tokens.new_empty((batch_size * top_k, d_ff))
 
@@ -253,12 +372,16 @@ def setup_grouped_gemm_autograd():
     from torch.library import register_autograd
 
     def setup_context(ctx, inputs, output):
-        ctx.tokens, ctx.weights, ctx.expert_ids = inputs
+        # inputs = (tokens, weights, expert_ids, use_triton)
+        # We only need the first 3 for backward pass
+        ctx.tokens, ctx.weights, ctx.expert_ids, ctx.use_triton = inputs
 
     def grouped_gemm_backward(ctx, grad_out):
-        return batched_grouped_gemm_backward(
+        # Return gradients for all inputs (use_triton gets None since it's not differentiable)
+        grad_tokens, grad_weights, grad_expert_ids = batched_grouped_gemm_backward(
             grad_out, ctx.tokens, ctx.weights, ctx.expert_ids
         )
+        return grad_tokens, grad_weights, grad_expert_ids, None
 
     register_autograd(
         "moe::grouped_gemm",
